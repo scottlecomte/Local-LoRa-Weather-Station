@@ -1,5 +1,6 @@
 import time
 import math
+import micropython
 from ucollections import namedtuple
 from urandom import getrandbits
 from machine import SPI
@@ -8,6 +9,14 @@ from machine import Pin
 #Constants
 FLAGS_ACK = 0x80
 BROADCAST_ADDRESS = 255
+
+# Hop count rides in the existing RadioHead flags byte (no added payload byte,
+# so a plain reading like "68.0" still follows the 4-byte header). Low 3 bits
+# are remaining hops. FLAGS_HOP_SET (bit 3) means a repeater wrote that count.
+# Bit 3 clear (current sensors send flags 0) means the full hop budget, not
+# "no hops left". FLAGS_ACK stays bit 7 (0x80).
+FLAGS_HOP_SET = 0x08
+FLAGS_HOP_MASK = 0x07
 
 REG_00_FIFO = 0x00
 REG_01_OP_MODE = 0x01
@@ -53,6 +62,9 @@ REG_09_PA_CONFIG = 0x09
 FXOSC = 32000000.0
 FSTEP = (FXOSC / 524288)
 
+def _scheduled_repeat(item):
+    item[0]._enqueue_repeat(item[1])
+
 class ModemConfig():
     Bw125Cr45Sf128 = (0x72, 0x74, 0x04) #< Bw = 125 kHz, Cr = 4/5, Sf = 128chips/symbol, CRC on. Default medium range
     Bw500Cr45Sf128 = (0x92, 0x74, 0x04) #< Bw = 500 kHz, Cr = 4/5, Sf = 128chips/symbol, CRC on. Fast+short range
@@ -71,7 +83,8 @@ class SPIConfig():
 
 class LoRa(object):
     def __init__(self, spi_channel, interrupt, this_address, cs_pin, reset_pin=None, freq=868.0, tx_power=14,
-                 modem_config=ModemConfig.Bw125Cr45Sf128, receive_all=False, acks=False, crypto=None):
+                 modem_config=ModemConfig.Bw125Cr45Sf128, receive_all=False, acks=False, crypto=None,
+                 repeater=False, repeat_hops=2, repeat_ack_from=None, repeat_seen_max=16, repeat_seen_ms=30000):
         """
         Lora(channel, interrupt, this_address, cs_pin, reset_pin=None, freq=868.0, tx_power=14,
                  modem_config=ModemConfig.Bw125Cr45Sf128, receive_all=False, acks=False, crypto=None)
@@ -86,6 +99,7 @@ class LoRa(object):
         receive_all: if True, don't filter packets on address
         acks: if True, request acknowledgments
         crypto: if desired, an instance of ucrypto AES (https://docs.pycom.io/firmwareapi/micropython/ucrypto/) - not tested
+        repeater: if True, rebroadcast foreign packets once from service_repeater()
         """
         
         self._spi_channel = spi_channel
@@ -99,6 +113,19 @@ class LoRa(object):
         self._modem_config = modem_config
         self._receive_all = receive_all
         self._acks = acks
+        self._repeater = repeater
+        if repeat_hops < 1:
+            repeat_hops = 1
+        if repeat_hops > FLAGS_HOP_MASK:
+            repeat_hops = FLAGS_HOP_MASK
+        self._repeat_hops = repeat_hops
+        self._repeat_ack_from = repeat_ack_from
+        self._repeat_seen_max = repeat_seen_max if repeat_seen_max > 0 else 1
+        self._repeat_seen_ms = repeat_seen_ms if repeat_seen_ms > 0 else 1
+        # Short memory of (header_from, header_id, ticks_ms). The payload is not kept.
+        self._repeat_seen = []
+        self._repeat_q = []
+        self._repeat_q_max = 4
 
         self._this_address = this_address
         self._last_header_id = 0
@@ -259,12 +286,15 @@ class LoRa(object):
             self._spi_write(REG_01_OP_MODE, MODE_STDBY)
             self._mode = MODE_STDBY
 
-    def send(self, data, header_to, header_id=0, header_flags=0):
+    def send(self, data, header_to, header_id=0, header_flags=0, header_from=None):
         self.wait_packet_sent()
         self.set_mode_idle()
         self.wait_cad()
 
-        header = [header_to, self._this_address, header_id, header_flags]
+        # A repeat passes the original header_from; normal sends use this node.
+        if header_from is None:
+            header_from = self._this_address
+        header = [header_to, header_from & 0xff, header_id & 0xff, header_flags & 0xff]
         if type(data) == int:
             data = [data]
         elif type(data) == bytes:
@@ -336,6 +366,77 @@ class LoRa(object):
         self.send(b'!', header_to, header_id, FLAGS_ACK)
         self.wait_packet_sent()
 
+    def _hops_remaining(self, header_flags):
+        if header_flags & FLAGS_HOP_SET:
+            return header_flags & FLAGS_HOP_MASK
+        return self._repeat_hops
+
+    def _flags_after_hop(self, header_flags, remaining):
+        hopped = remaining - 1
+        if hopped < 0:
+            hopped = 0
+        cleared = header_flags & ~(FLAGS_HOP_SET | FLAGS_HOP_MASK)
+        return cleared | FLAGS_HOP_SET | (hopped & FLAGS_HOP_MASK)
+
+    def _repeat_is_seen(self, header_from, header_id):
+        now = time.ticks_ms()
+        fresh = []
+        found = False
+        for src, pid, seen_at in self._repeat_seen:
+            if time.ticks_diff(now, seen_at) > self._repeat_seen_ms:
+                continue
+            fresh.append((src, pid, seen_at))
+            if src == header_from and pid == header_id:
+                found = True
+        if len(fresh) > self._repeat_seen_max:
+            fresh = fresh[-self._repeat_seen_max:]
+        self._repeat_seen = fresh
+        return found
+
+    def _repeat_remember(self, header_from, header_id):
+        self._repeat_seen.append((header_from, header_id, time.ticks_ms()))
+        if len(self._repeat_seen) > self._repeat_seen_max:
+            self._repeat_seen.pop(0)
+
+    def _enqueue_repeat(self, item):
+        if len(self._repeat_q) >= self._repeat_q_max:
+            self._repeat_q.pop(0)
+        self._repeat_q.append(item)
+
+    def _consider_repeat(self, header_to, header_from, header_id, header_flags, message):
+        if not self._repeater:
+            return
+        if header_from == self._this_address:
+            return
+        if header_flags & FLAGS_ACK:
+            # Not a general ACK rebroadcast. Only the bridge ACK is forwarded
+            # once, through this same seen-set, so a farther node can hear it.
+            if self._repeat_ack_from is None or header_from != self._repeat_ack_from:
+                return
+        remaining = self._hops_remaining(header_flags)
+        if remaining <= 0:
+            return
+        if self._repeat_is_seen(header_from, header_id):
+            return
+        self._repeat_remember(header_from, header_id)
+        item = (message, header_to, header_from, header_id, self._flags_after_hop(header_flags, remaining))
+        try:
+            micropython.schedule(_scheduled_repeat, (self, item))
+        except Exception:
+            self._enqueue_repeat(item)
+
+    def service_repeater(self):
+        # One rebroadcast, then the payload is dropped. Call while idle, never from the RX IRQ.
+        # The (header_from, header_id) key stays until REPEAT_SEEN_MS so the echo is not sent again.
+        if not self._repeater or not self._repeat_q:
+            return False
+        message, header_to, header_from, header_id, header_flags = self._repeat_q.pop(0)
+        print("REPEAT from=%d to=%d id=%d flags=0x%02x" % (header_from, header_to, header_id, header_flags))
+        self.send(message, header_to, header_id=header_id, header_flags=header_flags, header_from=header_from)
+        self.wait_packet_sent()
+        self.set_mode_rx()
+        return True
+
     def _spi_write(self, register, payload):
         if type(payload) == int:
             payload = [payload]
@@ -399,6 +500,9 @@ class LoRa(object):
                 message = bytes(packet[4:]) if packet_len > 4 else b''
 
                 if (self._this_address != header_to) and ((header_to != BROADCAST_ADDRESS) or (self._receive_all is False)):
+                    # Foreign packet. Repeater may queue it; do not ACK and do not deliver it locally.
+                    if self._repeater:
+                        self._consider_repeat(header_to, header_from, header_id, header_flags, message)
                     return
 
                 if self.crypto and len(message) % 16 == 0:

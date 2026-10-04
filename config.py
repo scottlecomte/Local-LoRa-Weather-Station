@@ -49,3 +49,11 @@ LORA_TX_TIMEOUT = 2  # seconds to wait for the radio to finish a transmit
 # Status LEDs (GP numbers). LED blinks on each send.
 LED_PIN = 13
 LED_TX_PIN = 12
+
+# Repeater. This node stays a client; only the bridge (SERVER_ADDRESS) sends ACKs.
+# REPEAT_HOPS is how many rebroadcasts an unstamped packet (flags 0) may still take.
+REPEAT_ENABLE = True    # rebroadcast foreign packets once
+REPEAT_HOPS = 2          # hop budget when the flags byte has no hop count yet
+REPEAT_SEEN_MAX = 16     # remembered (header_from, header_id) pairs
+REPEAT_SEEN_MS = 30000   # drop a seen pair after this many milliseconds
+

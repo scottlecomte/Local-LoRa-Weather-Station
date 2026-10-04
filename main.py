@@ -168,7 +168,10 @@ rain_sensor_armed = True
 rain_tip_count = 0
 
 # initialise radio
-lora = LoRa(SPIConfig.rp2_0, config.RFM95_INT, config.CLIENT_ADDRESS, config.RFM95_CS, reset_pin=config.RFM95_RST, freq=config.RF95_FREQ, tx_power=config.RF95_POW, acks=True)
+lora = LoRa(SPIConfig.rp2_0, config.RFM95_INT, config.CLIENT_ADDRESS, config.RFM95_CS, reset_pin=config.RFM95_RST, freq=config.RF95_FREQ, tx_power=config.RF95_POW, acks=True,
+            repeater=config.REPEAT_ENABLE, repeat_hops=config.REPEAT_HOPS,
+            repeat_ack_from=config.SERVER_ADDRESS, repeat_seen_max=config.REPEAT_SEEN_MAX,
+            repeat_seen_ms=config.REPEAT_SEEN_MS)
 lora.wait_packet_sent_timeout = config.LORA_TX_TIMEOUT
 
 i2c, bme = init_bme680(i2c)
@@ -315,6 +318,15 @@ def main():
                 print('Environmental send failed:', exc)
             next_env_send = time.ticks_add(now, config.ENV_INTERVAL_MS)
 
+        # Listen, and send one queued rebroadcast. Never from the RX IRQ.
+        # MODE_RXCONTINUOUS is 5. Re-enter RX after send_lora sleeps the radio,
+        # but do not rewrite RX every pass (that clears IRQ flags).
+        if lora._mode != 5:
+            try:
+                lora.set_mode_rx()
+            except Exception:
+                pass
+        lora.service_repeater()
         time.sleep_ms(config.LOOP_SLEEP_MS)
 
 def shutdown_hardware():
